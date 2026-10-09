@@ -1,0 +1,16 @@
+{
+  "channels": [0, 1, 2],
+  "frequency_hz": 50,
+  "speed_scale": 0.5,
+  "horizontal_trim": 0.0,
+  "input": "keyboard",
+  "gps_device": "/dev/ttyAMA0",
+  "gps_baudrate": 9600,
+  "heading_calibration": "Data/calibration/magnetometer.json",
+  "sensor_to_body": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+  "heading_source": "amg",
+  "waypoints": [
+    {"latitude": 29.3136, "longitude": -94.8170}
+  ],
+  "log_directory": "Data/GPSlogs"
+}

@@ -1,0 +1,6 @@
+inputs==0.5
+pyserial>=3.5,<4
+adafruit-blinka>=8,<9
+adafruit-circuitpython-lsm9ds1>=2,<3
+adafruit-circuitpython-ads1x15>=3,<4
+bluerobotics-navigator==0.2.0; platform_machine == "aarch64" or platform_machine == "armv7l"

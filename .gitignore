@@ -1,0 +1,18 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+config/vehicle.json
+
+# Local vehicle data, captures, calibration outputs, and run logs.
+Data/*
+!Data/.gitkeep
+!Data/calibration/
+Data/calibration/*
+!Data/calibration/.gitkeep
+!Data/GPSlogs/
+Data/GPSlogs/*
+!Data/GPSlogs/.gitkeep
+
+# Preserved local reference material from the previous SD-card image.
+archive/
