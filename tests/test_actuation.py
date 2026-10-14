@@ -68,3 +68,16 @@ def test_fault_latches_and_requires_explicit_rearm():
         assert "fault" in str(error).lower()
     else:
         raise AssertionError("faulted actuator accepted a motor command")
+
+
+def test_full_scale_mixer_matches_live_legacy_differential_3d_pulses():
+    backend = FakePwm()
+    actuator = NavigatorActuator(backend, channels=(0, 1, 2), speed_scale=1.0, sleep_fn=lambda _: None)
+    actuator.initialize()
+    actuator.arm()
+
+    actuator.command(MotionCommand(forward=0.3, yaw=0.0, vertical=-0.1))
+
+    assert duties_for(backend, 0)[-1] == 0.07875
+    assert duties_for(backend, 1)[-1] == 0.07125
+    assert duties_for(backend, 2)[-1] == 0.0725
