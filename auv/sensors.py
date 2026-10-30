@@ -3,11 +3,12 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from math import atan2, cos, degrees, radians, sin
+from math import atan2, degrees
 from time import monotonic
 from typing import Protocol
 
 from .models import HeadingSample, PositionSample
+from .navigation import Waypoint, bearing_degrees, distance_m
 
 
 class LineSource(Protocol):
@@ -62,15 +63,13 @@ class NmeaGpsReader:
 
         fields = raw[1:].split("*", 1)[0].split(",")
         if len(fields) < 7 or fields[2] != "A":
-            self._last_position = PositionSample(None, None, now, False, "GPS reports void fix")
-            return self._last_position
+            return self._invalidate(now, "GPS reports void fix")
         try:
             latitude = _nmea_degrees(fields[3], fields[4])
             longitude = _nmea_degrees(fields[5], fields[6])
             sample = PositionSample(latitude, longitude, now, True)
         except (IndexError, ValueError):
-            self._last_position = PositionSample(None, None, now, False, "invalid RMC coordinates")
-            return self._last_position
+            return self._invalidate(now, "invalid RMC coordinates")
 
         self._recent_positions.append(sample)
         latitude = sum(item.latitude for item in self._recent_positions if item.latitude is not None) / len(self._recent_positions)
@@ -80,7 +79,13 @@ class NmeaGpsReader:
 
     def _expired_or_last(self, now: float, error: str) -> PositionSample:
         if not self._last_position.valid or now - self._last_position.observed_at > self.max_fix_age_s:
-            self._last_position = PositionSample(None, None, now, False, error)
+            return self._invalidate(now, error)
+        return self._last_position
+
+    def _invalidate(self, now: float, error: str) -> PositionSample:
+        # Fixes from before a gap must not be averaged into the next valid fix.
+        self._recent_positions.clear()
+        self._last_position = PositionSample(None, None, now, False, error)
         return self._last_position
 
 
@@ -109,17 +114,37 @@ class VectorHeadingReader:
         return self._last
 
 
-def gps_track_heading(previous: PositionSample, current: PositionSample) -> HeadingSample:
-    """Return a valid heading only when both fixes are current and distinct."""
-    if not previous.valid or not current.valid or None in (previous.latitude, previous.longitude, current.latitude, current.longitude):
-        return HeadingSample(None, current.observed_at, False, "insufficient valid GPS fixes")
-    if previous.latitude == current.latitude and previous.longitude == current.longitude:
-        return HeadingSample(None, current.observed_at, False, "GPS position unchanged")
-    lat1, lat2 = radians(previous.latitude), radians(current.latitude)
-    delta_lon = radians(current.longitude - previous.longitude)
-    y = sin(delta_lon) * cos(lat2)
-    x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(delta_lon)
-    return HeadingSample(degrees(atan2(y, x)) % 360.0, current.observed_at, True)
+class GpsTrackHeading:
+    """Course over ground from GPS fixes at least `min_distance_m` apart.
+
+    The control loop runs much faster than GPS fixes arrive, so consecutive
+    ticks usually repeat one fix. Heading therefore comes from accumulated
+    displacement, and the last heading is kept with its fix time so consumers
+    can apply their own age limit.
+    """
+
+    def __init__(self, *, min_distance_m: float = 2.0) -> None:
+        if min_distance_m <= 0:
+            raise ValueError("min_distance_m must be positive")
+        self.min_distance_m = min_distance_m
+        self._anchor: PositionSample | None = None
+        self._last = HeadingSample(None, 0.0, False, "awaiting GPS movement")
+
+    def update(self, position: PositionSample) -> HeadingSample:
+        if not position.valid or position.latitude is None or position.longitude is None:
+            self._anchor = None
+            self._last = HeadingSample(None, position.observed_at, False, "GPS fix lost")
+            return self._last
+        anchor = self._anchor
+        if anchor is None or anchor.latitude is None or anchor.longitude is None:
+            self._anchor = position
+            return self._last
+        current = Waypoint(position.latitude, position.longitude)
+        if distance_m(anchor.latitude, anchor.longitude, current) < self.min_distance_m:
+            return self._last
+        self._last = HeadingSample(bearing_degrees(anchor.latitude, anchor.longitude, current), position.observed_at, True)
+        self._anchor = position
+        return self._last
 
 
 def tds_ppm(voltage: float, temperature_c: float = 25.0, *, calibration_factor: float = 1.0) -> float:

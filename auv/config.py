@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .navigation import Waypoint
+from .navigation import AutonomyLimits, Waypoint
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class RuntimeConfig:
     heading_source: str
     waypoints: list[Waypoint]
     log_directory: Path
+    autonomy_limits: AutonomyLimits
 
     @classmethod
     def load(cls, path: Path) -> "RuntimeConfig":
@@ -44,4 +45,14 @@ class RuntimeConfig:
             heading_source=data.get("heading_source", "amg"),
             waypoints=[Waypoint(latitude=float(item["latitude"]), longitude=float(item["longitude"])) for item in data.get("waypoints", [])],
             log_directory=Path(data.get("log_directory", "Data/GPSlogs")),
+            autonomy_limits=_autonomy_limits(data.get("autonomy_limits", {})),
         )
+
+
+def _autonomy_limits(data: dict) -> AutonomyLimits:
+    """Each limit is optional; an omitted or null value disables that limit."""
+    known = {"max_duration_s", "max_waypoint_s", "max_distance_m"}
+    unknown = set(data) - known
+    if unknown:
+        raise ValueError(f"unknown autonomy_limits keys: {', '.join(sorted(unknown))}")
+    return AutonomyLimits(**{key: None if data.get(key) is None else float(data[key]) for key in known})

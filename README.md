@@ -11,9 +11,10 @@ This repository is for the current Navigator runtime. Local captures, old SD-car
 
 - `auv/actuation.py` owns Navigator PWM, mixing, arming, disarming, and fault shutdown.
 - `auv/safety.py` decides whether the selected manual or autonomous command may move the vehicle.
-- `auv/navigation.py` contains the waypoint controller and geographic math without hardware dependencies.
-- `auv/sensors.py` and `auv/hardware.py` handle NMEA GPS, LSM9DS1 heading, and ADS1115 TDS input.
+- `auv/navigation.py` contains the waypoint controller, optional autonomous run limits, and geographic math without hardware dependencies.
+- `auv/sensors.py` and `auv/hardware.py` handle NMEA GPS, GPS track heading, LSM9DS1 heading, and ADS1115 TDS input.
 - `auv/runtime.py` is the control loop. No input or sensor adapter can command a motor directly.
+- `auv/failsafe.py` is the separate watcher process that neutralizes PWM if the armed runtime crashes or hangs.
 - `tools/` contains the isolated Navigator preflight and magnetometer capture/calibration utilities.
 - `config/vehicle.example.json` is the starting point for a vehicle-specific configuration.
 
@@ -53,6 +54,9 @@ Edit `config/vehicle.json` before use:
 | `sensor_to_body` | LSM9DS1-to-vehicle axis transform. Set this for the installed sensor orientation. |
 | `heading_source` | `amg` for LSM9DS1 heading or `gps` for track heading. |
 | `waypoints` | Latitude/longitude targets. An empty list leaves the runtime in manual-only operation. |
+| `autonomy_limits` | Optional `max_duration_s`, `max_waypoint_s`, and `max_distance_m` (from where autonomy was started). Omit a key or the whole object to disable that limit. |
+
+Hardware that is not configured is treated as absent, not as a fault: without `gps_device` (or, for `amg`, `heading_calibration`) the runtime prints a notice at startup and runs manual-only.
 
 `Data/` stays local by design. The runtime creates CSV logs under `Data/GPSlogs/`; calibration output belongs under `Data/calibration/`.
 
@@ -80,15 +84,34 @@ Edit `config/vehicle.json` before use:
    python -m auv --config config/vehicle.json --arm
    ```
 
-`Ctrl-C` and `SIGTERM` command neutral output, wait for the neutral dwell when armed, disable PWM, and close the run log. A process crash, native abort, or power loss still requires a physical motor-power disconnect.
+`Ctrl-C`, `SIGTERM`, and `SIGHUP` (for example an SSH disconnect) command neutral output, wait for the neutral dwell when armed, disable PWM, and close the run log.
+
+With `--arm`, the runtime also starts a watcher process (`auv/failsafe.py`) in its own session. The control loop sends it a heartbeat every cycle. If the runtime crashes, aborts natively, or stops cycling for 1 s, the watcher kills it, writes neutral PWM, and disables output. Loss of Pi power still requires the physical motor-power disconnect.
 
 ## Controls and motion policy
 
-Keyboard control uses `W/S` for forward/reverse, `A/D` for yaw, `R/F` for vertical movement, `X` for neutral, `M` to request autonomous mode, and space to latch an emergency stop. The keyboard path requires repeated events to remain fresh; if it goes stale, the runtime commands neutral PWM.
+Keyboard control is hold-to-drive:
+
+| Key | Action |
+| --- | --- |
+| `W` / `S` | Forward / reverse while held |
+| `A` / `D` | Turn left / right while held |
+| `Q` / `E` | Forward while turning left / right |
+| `R` / `F` | Up / down while held |
+| `1`–`5` | Speed level, 20% to 100% of `speed_scale` (default 2) |
+| `X` | Stop |
+| `M` | Toggle manual / autonomous |
+| Space | Latch emergency stop (restart to clear) |
+
+A terminal reports key presses but not releases, so the runtime treats the key's auto-repeat as "still held". Motion stops about 0.25 s after the repeats end; a single tap moves for 0.7 s so it bridges the terminal's initial repeat delay. Pressing a new key replaces the previous motion. A status line shows the mode, the command actually sent, the speed level, the actuator state, and why motion is being held back.
 
 Xbox control uses the left stick for forward/yaw, triggers for vertical motion, START to request autonomy, and BACK for emergency stop.
 
-Autonomy needs fresh, valid GPS and heading data. Invalid or void NMEA fixes clear the current position; `(0, 0)` is never treated as a valid location. If AMG heading is unavailable, autonomous motion is neutral. With GPS track heading, the controller may move straight ahead at no more than 10% while waiting for a second distinct GPS fix. An emergency stop, sensor-reader exception, or log-write failure faults the actuator; restart and re-arm only after correcting the cause.
+Positive yaw turns clockwise (right) for the keyboard, the Xbox stick, and the waypoint controller. During the props-off check, confirm that `D` spins the vehicle clockwise viewed from above; if it does not, the mixer direction is wrong and autonomy would steer the wrong way too.
+
+Manual control only resumes after the controls have returned to neutral: at startup and after every switch from autonomous back to manual. A command that was held before the switch is never replayed.
+
+Autonomy needs fresh, valid GPS and heading data. Invalid or void NMEA fixes clear the current position; `(0, 0)` is never treated as a valid location. If AMG heading is unavailable, autonomous motion is neutral. With GPS track heading, the vehicle creeps straight ahead at no more than 10% until it has moved at least 2 m, then steers from the course between fixes at least 2 m apart; that heading is used for up to 5 s. If an autonomous run exceeds one of its `autonomy_limits`, autonomy stops with neutral output but the actuator stays armed: switch back to manual to drive the vehicle, and toggle autonomy again to start a fresh run. An emergency stop, sensor-reader exception, or log-write failure faults the actuator; restart and re-arm only after correcting the cause.
 
 ## Magnetometer calibration
 
@@ -111,7 +134,7 @@ PYTHONPATH=. python -m py_compile auv/*.py tools/*.py
 PYTHONPATH=. python -m pytest tests -q
 ```
 
-These checks cover PWM neutral/disarm ordering, fault latching, mixing, NMEA fix invalidation, GPS-heading acquisition limits, navigation behavior, calibration persistence, configuration loading, and runtime integration. They do not validate physical hardware.
+These checks cover PWM neutral/disarm ordering, fault latching, mixing, hold-to-drive keyboard input, manual release after mode switches, autonomous run limits, the crash/hang watcher, NMEA fix invalidation, GPS track heading between fixes, navigation behavior, calibration persistence, configuration loading, and runtime integration. They do not validate physical hardware.
 
 ## References
 

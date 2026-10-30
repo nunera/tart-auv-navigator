@@ -29,6 +29,8 @@ class SafetyController:
         autonomous: MotionCommand,
         health: HealthSnapshot,
         permit_gps_heading_acquisition: bool = False,
+        manual_release_required: bool = False,
+        autonomy_stopped: str | None = None,
     ) -> SafetyDecision:
         if manual.emergency_stop_requested:
             return SafetyDecision(MotionCommand(), False, "operator emergency stop")
@@ -40,8 +42,12 @@ class SafetyController:
         if mode is ControlMode.MANUAL:
             if not health.input_fresh:
                 return SafetyDecision(MotionCommand(), False, "manual input stale")
+            if manual_release_required:
+                return SafetyDecision(MotionCommand(), False, "release controls to resume manual")
             return SafetyDecision(manual.command, True)
 
+        if autonomy_stopped:
+            return SafetyDecision(MotionCommand(), False, autonomy_stopped)
         if not health.gps_fresh:
             return SafetyDecision(MotionCommand(), False, "GPS unavailable or stale")
         if not health.heading_fresh:

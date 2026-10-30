@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import asin, atan2, cos, degrees, radians, sin, sqrt
+from math import asin, atan2, cos, degrees, isfinite, radians, sin, sqrt
 
-from .models import MotionCommand, NavigationObservation
+from .models import MotionCommand, NavigationObservation, PositionSample
 
 
 EARTH_RADIUS_M = 6_371_008.8
@@ -20,7 +20,7 @@ class Waypoint:
 
 
 def heading_error(target_degrees: float, current_degrees: float) -> float:
-    """Shortest signed target-current angle in [-180, 180). Positive is CCW/left."""
+    """Shortest signed target-current angle in [-180, 180). Positive is clockwise/right."""
     return (target_degrees - current_degrees + 180.0) % 360.0 - 180.0
 
 
@@ -39,8 +39,27 @@ def distance_m(latitude: float, longitude: float, target: Waypoint) -> float:
     return 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
 
 
+@dataclass(frozen=True)
+class AutonomyLimits:
+    """Optional bounds on one autonomous run. `None` disables that limit."""
+
+    max_duration_s: float | None = None
+    max_waypoint_s: float | None = None
+    max_distance_m: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("max_duration_s", "max_waypoint_s", "max_distance_m"):
+            value = getattr(self, name)
+            if value is not None and (not isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be a positive number or omitted")
+
+
 class NavigationController:
-    """Pure waypoint controller; invalid observations always produce neutral output."""
+    """Pure waypoint controller; invalid observations always produce neutral output.
+
+    Each enable() starts a new autonomous run. A run that breaches its limits
+    stops itself and records `abort_reason`; only a new enable() clears it.
+    """
 
     def __init__(
         self,
@@ -51,7 +70,9 @@ class NavigationController:
         drive_gain: float = 0.05,
         turn_gain: float = 0.02,
         max_heading_acquisition_forward: float = 0.1,
-        max_command_age_s: float = 0.5,
+        max_position_age_s: float = 1.5,
+        max_heading_age_s: float | None = None,
+        limits: AutonomyLimits = AutonomyLimits(),
     ) -> None:
         if heading_source not in {"amg", "gps"}:
             raise ValueError("heading_source must be 'amg' or 'gps'")
@@ -61,11 +82,24 @@ class NavigationController:
         self.drive_gain = drive_gain
         self.turn_gain = turn_gain
         self.max_heading_acquisition_forward = max_heading_acquisition_forward
-        self.max_command_age_s = max_command_age_s
+        # GPS fixes typically arrive at 1 Hz, so a position stays usable between fixes.
+        self.max_position_age_s = max_position_age_s
+        # GPS track heading only updates after the vehicle has moved a few metres.
+        self.max_heading_age_s = (
+            max_heading_age_s if max_heading_age_s is not None else (5.0 if heading_source == "gps" else 0.5)
+        )
+        self.limits = limits
         self.enabled = False
         self.complete = not self._initial_waypoints
+        self.abort_reason: str | None = None
         self._waypoint_index = 0
-        self._last_command = MotionCommand()
+        self._run_started_at: float | None = None
+        self._waypoint_started_at: float | None = None
+        self._run_origin: PositionSample | None = None
+
+    @property
+    def waypoints(self) -> tuple[Waypoint, ...]:
+        return self._initial_waypoints
 
     @property
     def target(self) -> Waypoint:
@@ -74,44 +108,72 @@ class NavigationController:
     def enable(self) -> None:
         self.complete = not self._initial_waypoints
         self.enabled = not self.complete
-        self._last_command = MotionCommand()
+        self.abort_reason = None
+        self._run_started_at = None
+        self._waypoint_started_at = None
+        self._run_origin = None
 
     def disable(self) -> None:
         self.enabled = False
-        self._last_command = MotionCommand()
 
     def reset(self) -> None:
         self.disable()
         self.complete = not self._initial_waypoints
+        self.abort_reason = None
         self._waypoint_index = 0
 
     def tick(self, observation: NavigationObservation) -> MotionCommand:
         if not self.enabled or self.complete:
             return MotionCommand()
-        if not observation.position.valid or observation.position.latitude is None or observation.position.longitude is None:
+        now = observation.now
+        if self._run_started_at is None:
+            self._run_started_at = now
+            self._waypoint_started_at = now
+        limits = self.limits
+        if limits.max_duration_s is not None and now - self._run_started_at > limits.max_duration_s:
+            return self._abort(f"autonomous run exceeded {limits.max_duration_s:g} s")
+        if limits.max_waypoint_s is not None and now - self._waypoint_started_at > limits.max_waypoint_s:
+            return self._abort(f"waypoint {self._waypoint_index + 1} not reached within {limits.max_waypoint_s:g} s")
+
+        position = observation.position
+        if not position.valid or position.latitude is None or position.longitude is None:
             return MotionCommand()
-        if observation.now - observation.position.observed_at > self.max_command_age_s:
+        if now - position.observed_at > self.max_position_age_s:
             return MotionCommand()
 
-        distance = distance_m(observation.position.latitude, observation.position.longitude, self.target)
+        if self._run_origin is None:
+            self._run_origin = position
+        if limits.max_distance_m is not None:
+            assert self._run_origin.latitude is not None and self._run_origin.longitude is not None
+            travelled = distance_m(
+                self._run_origin.latitude, self._run_origin.longitude, Waypoint(position.latitude, position.longitude)
+            )
+            if travelled > limits.max_distance_m:
+                return self._abort(f"{travelled:.0f} m from autonomy start exceeds {limits.max_distance_m:g} m")
+
+        distance = distance_m(position.latitude, position.longitude, self.target)
         if distance <= self.arrival_radius_m:
             if self._waypoint_index == len(self._initial_waypoints) - 1:
                 self.complete = True
                 self.enabled = False
                 return MotionCommand()
             self._waypoint_index += 1
+            self._waypoint_started_at = now
             return MotionCommand()
 
         heading = observation.heading
-        if not heading.valid or heading.degrees is None or observation.now - heading.observed_at > self.max_command_age_s:
+        if not heading.valid or heading.degrees is None or now - heading.observed_at > self.max_heading_age_s:
             if self.heading_source == "gps":
                 return MotionCommand(forward=self.max_heading_acquisition_forward)
             return MotionCommand()
 
-        target_bearing = bearing_degrees(observation.position.latitude, observation.position.longitude, self.target)
+        target_bearing = bearing_degrees(position.latitude, position.longitude, self.target)
         error = heading_error(target_bearing, heading.degrees)
         forward = min(1.0, max(0.0, self.drive_gain * distance))
         yaw = min(1.0, max(-1.0, self.turn_gain * error))
-        command = MotionCommand(forward=forward, yaw=yaw)
-        self._last_command = command
-        return command
+        return MotionCommand(forward=forward, yaw=yaw)
+
+    def _abort(self, reason: str) -> MotionCommand:
+        self.abort_reason = reason
+        self.enabled = False
+        return MotionCommand()

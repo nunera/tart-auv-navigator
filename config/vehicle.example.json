@@ -12,5 +12,10 @@
   "waypoints": [
     {"latitude": 29.3136, "longitude": -94.8170}
   ],
+  "autonomy_limits": {
+    "max_duration_s": 300,
+    "max_waypoint_s": 120,
+    "max_distance_m": 100
+  },
   "log_directory": "Data/GPSlogs"
 }
